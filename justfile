@@ -7,3 +7,6 @@ default:
 # Runs the emulator
 run-emu:
   zig run ./emulator/emu.zig
+
+test:
+  zig build test --summary all
