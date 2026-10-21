@@ -109,9 +109,11 @@ pub const Cpu = struct {
     }
 
     fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
+        if (addr == uart_status) return 1;
+
         const len: u64 = self.mem.len;
         if (size > len or addr > len - size) return null; // out of range
-        if (addr == uart_status) return 1;
+
         const off: usize = @intCast(addr);
         const v: u64 = switch (size) {
             1 => self.mem[off],

@@ -388,3 +388,109 @@ test "Cpu: sum an array in memory" {
     try expectEqual(@as(usize, 20), run(&cpu, 100));
     try expectEqual(@as(u64, 10), cpu.getReg(a1));
 }
+
+test "Encoder: hi word matches the hand-computed value" {
+    try expectEqual(@as(u32, 0x0C802000), emu.lT(.hi, a0, 0x2000));
+}
+
+test "Cpu: bytes written to the UART are captured" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a0, 0x2000), //      0: a0 = UART address
+        emu.aluImm(.mov, a1, 'H'), //    1
+        emu.storeT(.sb, a1, a0, 0), //   2: print 'H'
+        emu.aluImm(.mov, a1, 'i'), //    3
+        emu.storeT(.sb, a1, a0, 0), //   4: print 'i'
+        emu.ebreak(), //                 5
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 20);
+
+    try std.testing.expectEqualStrings("Hi", cpu.uartText());
+}
+
+test "Cpu: a wider store to the UART prints only the low byte" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a2, 0x2000),
+        emu.aluImm(.mov, a0, 0x1234), // low byte 0x34 is '4'
+        emu.storeT(.sw, a0, a2, 0),
+        emu.ebreak(),
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 20);
+
+    try std.testing.expectEqualStrings("4", cpu.uartText());
+}
+
+test "Cpu: the UART status register reads 1 (ready)" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a2, 0x2000),
+        emu.loadT(.lbu, a1, a2, 4), // read the status register
+        emu.ebreak(),
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 10);
+
+    try expectEqual(@as(u64, 1), cpu.getReg(a1));
+}
+
+test "Cpu: reading the UART transmit register faults" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a2, 0x2000),
+        emu.aluImm(.mov, a1, 7),
+        emu.loadT(.lbu, a1, a2, 0), // the transmit register is write-only
+        emu.ebreak(), //               never reached
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 3), run(&cpu, 10));
+    try expectEqual(@as(u64, 7), cpu.getReg(a1)); // the failed load changed nothing
+}
+
+test "Cpu: an address next to the UART faults and prints nothing" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a2, 0x2000),
+        emu.storeT(.sb, a0, a2, 8), // 0x1000_0008: nothing lives there
+        emu.ebreak(), //               never reached
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 2), run(&cpu, 10));
+    try expectEqual(@as(usize, 0), cpu.uartText().len);
+}
+
+test "Cpu: hello program prints a string" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    cpu.echo = false;
+    const prog = [_]u32{
+        emu.lT(.hi, a0, 0x2000), //      0: a0 = UART address
+        emu.aluImm(.mov, a2, 128), //    1: a2 = address of the string
+        emu.loadT(.lbu, a1, a2, 0), //   2: loop: a1 = byte at [a2]
+        emu.iT(.beq, a1, zero, 4), //    3: if a1 == 0 goto 7
+        emu.storeT(.sb, a1, a0, 0), //   4: write a1 to the UART
+        emu.aluImm(.add, a2, 1), //      5: a2 += 1
+        emu.lT(.jal, zero, -4), //       6: goto 2
+        emu.ebreak(), //                 7
+    };
+    load(&ram, &prog);
+    const msg = "Hello from BARE64!\n\x00";
+    @memcpy(ram[128..][0..msg.len], msg[0..msg.len]);
+
+    try expectEqual(@as(usize, 100), run(&cpu, 1000));
+    try std.testing.expectEqualStrings("Hello from BARE64!\n", cpu.uartText());
+}
