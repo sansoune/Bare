@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const Opcode = enum(u6) {
+pub const Opcode = enum(u6) {
     illegal = 0x00, // an all-zero word must never run
     alu = 0x01, // every arithmetic and logic instruction
     hi = 0x03, // was lui
@@ -17,7 +17,7 @@ const Opcode = enum(u6) {
     _,
 };
 
-const Func = enum(u5) {
+pub const Func = enum(u5) {
     mov = 0, // dst = src
     add,
     sub,
@@ -33,7 +33,7 @@ const Func = enum(u5) {
     _,
 };
 
-const Priv = enum(u5) {
+pub const Priv = enum(u5) {
     ecall = 0,
     ebreak = 1,
     _,
@@ -151,17 +151,21 @@ pub const Cpu = struct {
     }
 };
 
-fn aluReg(f: Func, dst: u32, src: u32) u32 { // dst = dst <f> register
+pub fn aluReg(f: Func, dst: u32, src: u32) u32 { // dst = dst <f> register
     return (@as(u32, @intFromEnum(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @intFromEnum(f)) << 16) | src;
 }
-fn aluImm(f: Func, dst: u32, imm: i32) u32 { // dst = dst <f> immediate
+pub fn aluImm(f: Func, dst: u32, imm: i32) u32 { // dst = dst <f> immediate
     return (@as(u32, @intFromEnum(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @intFromEnum(f)) << 16) | (1 << 15) | (@as(u32, @bitCast(imm)) & 0x7FFF);
 }
-fn iT(op: Opcode, a: u32, b: u32, imm: i32) u32 {
+pub fn iT(op: Opcode, a: u32, b: u32, imm: i32) u32 {
     return (@as(u32, @intFromEnum(op)) << 26) | (a << 21) | (b << 16) | (@as(u32, @bitCast(imm)) & 0xFFFF);
 }
-fn ebreak() u32 {
+pub fn ebreak() u32 {
     return (@as(u32, @intFromEnum(Opcode.priv)) << 26) | (@as(u32, @intFromEnum(Priv.ebreak)) << 16);
+}
+
+pub fn lT(op: Opcode, rd: u32, imm: i32) u32 {
+    return (@as(u32, @intFromEnum(op)) << 26) | (rd << 21) | (@as(u32, @bitCast(imm)) & 0x1FFFFF);
 }
 
 const zero = 0;
