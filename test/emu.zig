@@ -6,6 +6,7 @@ const zero = 0;
 const a0 = 4;
 const a1 = 5;
 const a2 = 6;
+const a3 = 7;
 const all_ones = ~@as(u64, 0);
 
 fn load(ram: []u8, prog: []const u32) void {
@@ -54,6 +55,22 @@ fn branchTaken(op: emu.Opcode, x: u64, y: u64) bool {
     cpu.setReg(a1, y);
     _ = run(&cpu, 10);
     return cpu.getReg(a2) == 2;
+}
+
+fn loadExtend(st: emu.Opcode, signed: emu.Opcode, unsigned: emu.Opcode) [2]u64 {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 128), //       0: a2 = data address
+        emu.aluImm(.mov, a0, -2), //        1: a0 = -2
+        emu.storeT(st, a0, a2, 0), //       2: store it
+        emu.loadT(signed, a1, a2, 0), //    3: signed read-back
+        emu.loadT(unsigned, a3, a2, 0), //  4: unsigned read-back
+        emu.ebreak(), //                    5
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 10);
+    return .{ cpu.getReg(a1), cpu.getReg(a3) };
 }
 
 test "Cpu: writting to registers" {
@@ -236,4 +253,138 @@ test "Cpu: sum 1..10 loop" {
 
     try expectEqual(@as(usize, 34), run(&cpu, 1000));
     try expectEqual(@as(u64, 55), cpu.getReg(a0));
+}
+
+test "Cpu: a word round trip is little-endian" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 128), //     0: a2 = data address
+        emu.lT(.hi, a0, 0x2244), //       1: a0 = 0x11220000
+        emu.aluImm(.add, a0, 0x3344), //  2: a0 = 0x11223344
+        emu.storeT(.sw, a0, a2, 0), //    3: store the word
+        emu.loadT(.lbu, a1, a2, 0), //    4: the first byte in memory
+        emu.loadT(.lw, a3, a2, 0), //     5: the whole word back
+        emu.ebreak(),
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 20);
+
+    try expectEqual(@as(u64, 0x44), cpu.getReg(a1)); // low byte comes first
+    try expectEqual(@as(u64, 0x11223344), cpu.getReg(a3));
+    try expectEqual(@as(u8, 0x44), ram[128]);
+    try expectEqual(@as(u8, 0x11), ram[131]);
+}
+
+test "Cpu: lb/lh/lw sign-extend, lbu/lhu/lwu zero-extend" {
+    const neg2: u64 = @bitCast(@as(i64, -2));
+    try expectEqual([2]u64{ neg2, 0xFE }, loadExtend(.sb, .lb, .lbu));
+    try expectEqual([2]u64{ neg2, 0xFFFE }, loadExtend(.sh, .lh, .lhu));
+    try expectEqual([2]u64{ neg2, 0xFFFF_FFFE }, loadExtend(.sw, .lw, .lwu));
+    try expectEqual([2]u64{ neg2, neg2 }, loadExtend(.sd, .ld, .ld)); // 64 bits: nothing to extend
+}
+
+test "Cpu: a store changes only its own bytes" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 128),
+        emu.aluImm(.mov, a0, 0x7F),
+        emu.storeT(.sb, a0, a2, 1), //   write only the byte at 129
+        emu.loadT(.lw, a1, a2, 0), //    read the whole word at 128
+        emu.ebreak(),
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 10);
+
+    try expectEqual(@as(u64, 0x7F00), cpu.getReg(a1));
+}
+
+test "Cpu: offsets are signed" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 132),
+        emu.aluImm(.mov, a0, 55),
+        emu.storeT(.sb, a0, a2, -4), //   address = 132 - 4 = 128
+        emu.aluImm(.mov, a2, 128),
+        emu.loadT(.lbu, a1, a2, 0),
+        emu.ebreak(),
+    };
+    load(&ram, &prog);
+    _ = run(&cpu, 10);
+
+    try expectEqual(@as(u64, 55), cpu.getReg(a1));
+}
+
+test "Cpu: a misaligned load halts and changes nothing" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 129), //     not a multiple of 4
+        emu.aluImm(.mov, a1, 7),
+        emu.loadT(.lw, a1, a2, 0), //     faults
+        emu.ebreak(), //                  never reached
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 3), run(&cpu, 10)); // 3 steps: stopped by the fault, not the ebreak
+    try std.testing.expect(cpu.halted);
+    try expectEqual(@as(u64, 7), cpu.getReg(a1));
+}
+
+test "Cpu: a misaligned store halts and writes nothing" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 129),
+        emu.aluImm(.mov, a0, 5),
+        emu.storeT(.sw, a0, a2, 0), //    faults
+        emu.ebreak(), //                  never reached
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 3), run(&cpu, 10));
+    try expectEqual(@as(u8, 0), ram[129]);
+}
+
+test "Cpu: the last byte of memory is readable, one past it is not" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    ram[255] = 9;
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 255),
+        emu.loadT(.lbu, a1, a2, 0), //    the last byte: fine
+        emu.aluImm(.mov, a2, 256),
+        emu.aluImm(.mov, a3, 7),
+        emu.loadT(.lbu, a3, a2, 0), //    one past the end: access fault
+        emu.ebreak(), //                  never reached
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 5), run(&cpu, 10));
+    try expectEqual(@as(u64, 9), cpu.getReg(a1));
+    try expectEqual(@as(u64, 7), cpu.getReg(a3)); // the faulting load changed nothing
+}
+
+test "Cpu: sum an array in memory" {
+    var ram: [256]u8 = @splat(0);
+    var cpu = emu.Cpu.init(&ram);
+    for ([_]u32{ 1, 2, 3, 4 }, 0..) |v, i| {
+        std.mem.writeInt(u32, ram[128 + i * 4 ..][0..4], v, .little);
+    }
+    const prog = [_]u32{
+        emu.aluImm(.mov, a2, 128), //     0: a2 = pointer to the array
+        emu.aluImm(.mov, a1, 0), //       1: a1 = sum
+        emu.aluImm(.mov, a3, 144), //     2: a3 = end of the array (128 + 4 words * 4 bytes)
+        emu.loadT(.lw, a0, a2, 0), //     3: loop: a0 = next element
+        emu.aluReg(.add, a1, a0), //      4: sum += a0
+        emu.aluImm(.add, a2, 4), //       5: pointer += 4
+        emu.iT(.bne, a2, a3, -3), //      6: if pointer != end goto loop
+        emu.ebreak(), //                  7
+    };
+    load(&ram, &prog);
+
+    try expectEqual(@as(usize, 20), run(&cpu, 100));
+    try expectEqual(@as(u64, 10), cpu.getReg(a1));
 }

@@ -5,6 +5,17 @@ pub const Opcode = enum(u6) {
     alu = 0x01, // every arithmetic and logic instruction
     hi = 0x03, // was lui
     pchi = 0x04, // was auipc
+    lb = 0x08,
+    lbu = 0x09,
+    lh = 0x0A,
+    lhu = 0x0B,
+    lw = 0x0C,
+    lwu = 0x0D,
+    ld = 0x0E,
+    sb = 0x10,
+    sh = 0x11,
+    sw = 0x12,
+    sd = 0x13,
     beq = 0x18,
     bne = 0x19,
     blt = 0x1A,
@@ -39,6 +50,21 @@ pub const Priv = enum(u5) {
     _,
 };
 
+fn sext8(v: u64) u64 {
+    const t: u8 = @truncate(v);
+    return @bitCast(@as(i64, @as(i8, @bitCast(t))));
+}
+
+fn sext16(v: u64) u64 {
+    const t: u16 = @truncate(v);
+    return @bitCast(@as(i64, @as(i16, @bitCast(t))));
+}
+
+fn sext32(v: u64) u64 {
+    const t: u32 = @truncate(v);
+    return @bitCast(@as(i64, @as(i32, @bitCast(t))));
+}
+
 pub const Cpu = struct {
     regs: [32]u64 = @splat(0),
     pc: u64 = 0,
@@ -67,6 +93,39 @@ pub const Cpu = struct {
         self.halted = true;
     }
 
+    fn fault(self: *Cpu, what: []const u8, value: u64) void {
+        std.debug.print("{s}: 0x{x} at pc=0x{x}\n", .{ what, value, self.pc });
+        self.halted = true;
+    }
+
+    fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
+        const len: u64 = self.mem.len;
+        if (size > len or addr > len - size) return null; // out of range
+        const off: usize = @intCast(addr);
+        const v: u64 = switch (size) {
+            1 => self.mem[off],
+            2 => std.mem.readInt(u16, self.mem[off..][0..2], .little),
+            4 => std.mem.readInt(u32, self.mem[off..][0..4], .little),
+            8 => std.mem.readInt(u64, self.mem[off..][0..8], .little),
+            else => unreachable,
+        };
+        return v;
+    }
+
+    fn memStore(self: *Cpu, addr: u64, size: u64, value: u64) bool {
+        const len: u64 = self.mem.len;
+        if (size > len or addr > len - size) return false; // out of range
+        const off: usize = @intCast(addr);
+        switch (size) {
+            1 => self.mem[off] = @truncate(value),
+            2 => std.mem.writeInt(u16, self.mem[off..][0..2], @truncate(value), .little),
+            4 => std.mem.writeInt(u32, self.mem[off..][0..4], @truncate(value), .little),
+            8 => std.mem.writeInt(u64, self.mem[off..][0..8], value, .little),
+            else => unreachable,
+        }
+        return true;
+    }
+
     pub fn step(self: *Cpu) void {
         const inst = self.fetch();
 
@@ -88,8 +147,8 @@ pub const Cpu = struct {
 
         switch (op) {
             .alu => {
-                const x = self.regs[a];
-                const y: u64 = if (is_imm) @bitCast(simm15) else self.regs[@as(u5, @truncate(src))];
+                const x = self.getReg(a);
+                const y: u64 = if (is_imm) @bitCast(simm15) else self.getReg(@as(u5, @truncate(src)));
                 const func: Func = @enumFromInt(funct);
                 const sx: i64 = @bitCast(x);
                 const sy: i64 = @bitCast(y);
@@ -114,9 +173,42 @@ pub const Cpu = struct {
             },
             .hi => self.setReg(a, @bitCast(simm21 << 15)),
             .pchi => self.setReg(a, self.pc +% @as(u64, @bitCast(simm21 << 15))),
+            .lb, .lbu, .lh, .lhu, .lw, .lwu, .ld => {
+                const addr = self.getReg(b) +% @as(u64, @bitCast(simm16));
+                const size: u64 = switch (op) {
+                    .lb, .lbu => 1,
+                    .lh, .lhu => 2,
+                    .lw, .lwu => 4,
+                    else => 8,
+                };
+                if (addr & (size - 1) != 0) return self.fault("load address misaligned", addr);
+                const raw = self.memLoad(addr, size) orelse
+                    return self.fault("load access fault", addr);
+                const v: u64 = switch (op) {
+                    .lb => sext8(raw),
+                    .lh => sext16(raw),
+                    .lw => sext32(raw),
+                    else => raw, // lbu, lhu, lwu, ld: already zero-extended
+                };
+                self.setReg(a, v);
+            },
+            .sb, .sh, .sw, .sd => {
+                // For stores, A is the data register and B is the base address register.
+                const addr = self.getReg(b) +% @as(u64, @bitCast(simm16));
+                const size: u64 = switch (op) {
+                    .sb => 1,
+                    .sh => 2,
+                    .sw => 4,
+                    else => 8,
+                };
+                if (addr & (size - 1) != 0) return self.fault("store address misaligned", addr);
+                if (!self.memStore(addr, size, self.getReg(a))) {
+                    return self.fault("store access fault", addr);
+                }
+            },
             .beq, .bne, .blt, .bge, .bltu, .bgeu => {
-                const x = self.regs[a];
-                const y = self.regs[b];
+                const x = self.getReg(a);
+                const y = self.getReg(b);
                 const sx: i64 = @bitCast(x);
                 const sy: i64 = @bitCast(y);
                 const taken = switch (op) {
@@ -135,7 +227,7 @@ pub const Cpu = struct {
             },
             .jalr => {
                 // Compute the target BEFORE writing rd: rd and rs1 may be the same register.
-                const target = (self.regs[b] +% @as(u64, @bitCast(simm16))) & ~@as(u64, 3);
+                const target = (self.getReg(b) +% @as(u64, @bitCast(simm16))) & ~@as(u64, 3);
                 self.setReg(a, self.pc +% 4);
                 next_pc = target;
             },
@@ -168,6 +260,14 @@ pub fn lT(op: Opcode, rd: u32, imm: i32) u32 {
     return (@as(u32, @intFromEnum(op)) << 26) | (rd << 21) | (@as(u32, @bitCast(imm)) & 0x1FFFFF);
 }
 
+pub fn loadT(op: Opcode, rd: u32, base: u32, offset: i32) u32 {
+    return iT(op, rd, base, offset);
+}
+// A holds the data register and B the base (the same layout as a branch).
+pub fn storeT(op: Opcode, src: u32, base: u32, offset: i32) u32 {
+    return iT(op, src, base, offset);
+}
+
 const zero = 0;
 const a0 = 4;
 const a1 = 5;
@@ -175,22 +275,29 @@ const a2 = 6;
 
 pub fn main() void {
     var ram: [4096]u8 = @splat(0);
+    var cpu = Cpu.init(&ram);
 
-    // a0 = 1 + 2 + ... + 10
     const prog = [_]u32{
-        aluImm(.mov, a0, 0), //   0: a0 = 0   (sum)
-        aluImm(.mov, a1, 1), //   1: a1 = 1   (i)
-        aluImm(.mov, a2, 11), //  2: a2 = 11  (limit)
-        aluReg(.add, a0, a1), //  3: loop: a0 += a1
-        aluImm(.add, a1, 1), //   4: a1 += 1
-        iT(.bne, a1, a2, -2), //  5: if a1 != a2 goto 3
-        ebreak(), //              6: halt
+        aluImm(.mov, a2, 256), //   0: a2 = address of the array
+        aluImm(.mov, a0, 10), //    1
+        storeT(.sw, a0, a2, 0), //  2: [256] = 10
+        aluImm(.mov, a0, 20), //    3
+        storeT(.sw, a0, a2, 4), //  4: [260] = 20
+        aluImm(.mov, a0, 30), //    5
+        storeT(.sw, a0, a2, 8), //  6: [264] = 30
+        aluImm(.mov, a1, 0), //     7: a1 = sum
+        loadT(.lw, a0, a2, 0), //   8
+        aluReg(.add, a1, a0), //    9
+        loadT(.lw, a0, a2, 4), //  10
+        aluReg(.add, a1, a0), //   11
+        loadT(.lw, a0, a2, 8), //  12
+        aluReg(.add, a1, a0), //   13
+        ebreak(), //               14
     };
     for (prog, 0..) |w, i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], w, .little);
 
-    var cpu = Cpu.init(&ram);
     var steps: usize = 0;
     while (!cpu.halted and steps < 1000) : (steps += 1) cpu.step();
 
-    std.debug.print("a0 = {d}, a1 = {d}, steps = {d}\n", .{ cpu.regs[a0], cpu.regs[a1], steps });
+    std.debug.print("a1 = {d}, ram[256] = {d}, steps = {d}\n", .{ cpu.getReg(a1), ram[256], steps });
 }
