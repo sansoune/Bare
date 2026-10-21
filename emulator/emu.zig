@@ -50,6 +50,9 @@ pub const Priv = enum(u5) {
     _,
 };
 
+const uart_tx: u64 = 0x1000_0000;
+const uart_status: u64 = 0x1000_0004;
+
 fn sext8(v: u64) u64 {
     const t: u8 = @truncate(v);
     return @bitCast(@as(i64, @as(i8, @bitCast(t))));
@@ -70,6 +73,9 @@ pub const Cpu = struct {
     pc: u64 = 0,
     mem: []u8,
     halted: bool = false,
+    echo: bool = true, // also print UART bytes to the terminal (tests turn this off)
+    uart_buf: [256]u8 = undefined, // a copy of everything the program printed
+    uart_len: usize = 0,
 
     pub fn init(mem: []u8) Cpu {
         return .{ .mem = mem };
@@ -81,6 +87,10 @@ pub const Cpu = struct {
 
     pub fn setReg(self: *Cpu, index: u5, value: u64) void {
         if (index != 0) self.regs[index] = value;
+    }
+
+    pub fn uartText(self: *const Cpu) []const u8 {
+        return self.uart_buf[0..self.uart_len];
     }
 
     pub fn fetch(self: *Cpu) u32 {
@@ -101,6 +111,7 @@ pub const Cpu = struct {
     fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
         const len: u64 = self.mem.len;
         if (size > len or addr > len - size) return null; // out of range
+        if (addr == uart_status) return 1;
         const off: usize = @intCast(addr);
         const v: u64 = switch (size) {
             1 => self.mem[off],
@@ -113,6 +124,16 @@ pub const Cpu = struct {
     }
 
     fn memStore(self: *Cpu, addr: u64, size: u64, value: u64) bool {
+        if (addr == uart_tx) {
+            const byte: u8 = @truncate(value);
+            if (self.uart_len < self.uart_buf.len) {
+                self.uart_buf[self.uart_len] = byte;
+                self.uart_len += 1;
+            }
+            if (self.echo) std.debug.print("{c}", .{byte});
+            return true;
+        }
+
         const len: u64 = self.mem.len;
         if (size > len or addr > len - size) return false; // out of range
         const off: usize = @intCast(addr);
@@ -278,26 +299,22 @@ pub fn main() void {
     var cpu = Cpu.init(&ram);
 
     const prog = [_]u32{
-        aluImm(.mov, a2, 256), //   0: a2 = address of the array
-        aluImm(.mov, a0, 10), //    1
-        storeT(.sw, a0, a2, 0), //  2: [256] = 10
-        aluImm(.mov, a0, 20), //    3
-        storeT(.sw, a0, a2, 4), //  4: [260] = 20
-        aluImm(.mov, a0, 30), //    5
-        storeT(.sw, a0, a2, 8), //  6: [264] = 30
-        aluImm(.mov, a1, 0), //     7: a1 = sum
-        loadT(.lw, a0, a2, 0), //   8
-        aluReg(.add, a1, a0), //    9
-        loadT(.lw, a0, a2, 4), //  10
-        aluReg(.add, a1, a0), //   11
-        loadT(.lw, a0, a2, 8), //  12
-        aluReg(.add, a1, a0), //   13
-        ebreak(), //               14
+        lT(.hi, a0, 0x2000), //      0: a0 = 0x2000 << 15 = the UART address
+        aluImm(.mov, a2, 128), //    1: a2 = address of the string
+        loadT(.lbu, a1, a2, 0), //   2: loop: a1 = byte at [a2]
+        iT(.beq, a1, zero, 4), //    3: if a1 == 0 goto 7 (done)
+        storeT(.sb, a1, a0, 0), //   4: write a1 to the UART
+        aluImm(.add, a2, 1), //      5: a2 += 1
+        lT(.jal, zero, -4), //       6: goto 2
+        ebreak(), //                 7: done
     };
     for (prog, 0..) |w, i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], w, .little);
+
+    const msg = "Hello from BARE64!\n\x00";
+    @memcpy(ram[128..][0..msg.len], msg[0..msg.len]);
 
     var steps: usize = 0;
     while (!cpu.halted and steps < 1000) : (steps += 1) cpu.step();
 
-    std.debug.print("a1 = {d}, ram[256] = {d}, steps = {d}\n", .{ cpu.getReg(a1), ram[256], steps });
+    std.debug.print("steps = {d}\n", .{steps});
 }
