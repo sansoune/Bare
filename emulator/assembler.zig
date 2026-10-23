@@ -54,6 +54,107 @@ fn aluFunc(name: []const u8) ?emu.Func {
     return std.meta.stringToEnum(emu.Func, name);
 }
 
+fn is(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+fn needOperands(args: []const []const u8, n: usize) AsmError!void {
+    if (args.len != n) return error.WrongOperandCount;
+}
+
+fn reg(text: []const u8) AsmError!u5 {
+    const r = parseReg(text) orelse return error.BadRegister;
+    return r;
+}
+
+fn number(text: []const u8, min_v: i64, max_v: i64) AsmError!i64 {
+    const n = parseNumber(text) orelse return error.BadOperand;
+    if (n < min_v or n > max_v) return error.ImmediateOutOfRange;
+    return n;
+}
+
+fn asmAlu(func: emu.Func, args: []const []const u8) AsmError!u32 {
+    try needOperands(args, 2);
+    const dst = try reg(args[0]);
+    if (parseReg(args[1])) |src| return emu.aluReg(func, dst, src);
+    const imm = try number(args[1], -16384, 16383);
+    return emu.aluImm(func, dst, @intCast(imm));
+}
+
+const MemOp = struct { name: []const u8, op: emu.Opcode, store: bool };
+
+const mem_ops = [_]MemOp{
+    .{ .name = "ld.b", .op = .lb, .store = false },
+    .{ .name = "ld.bu", .op = .lbu, .store = false },
+    .{ .name = "ld.h", .op = .lh, .store = false },
+    .{ .name = "ld.hu", .op = .lhu, .store = false },
+    .{ .name = "ld.w", .op = .lw, .store = false },
+    .{ .name = "ld.wu", .op = .lwu, .store = false },
+    .{ .name = "ld.d", .op = .ld, .store = false },
+    .{ .name = "st.b", .op = .sb, .store = true },
+    .{ .name = "st.h", .op = .sh, .store = true },
+    .{ .name = "st.w", .op = .sw, .store = true },
+    .{ .name = "st.d", .op = .sd, .store = true },
+};
+
+const MemOperand = struct { base: u5, offset: i16 };
+
+fn parseMem(text: []const u8) AsmError!MemOperand {
+    if (text.len < 3 or text[0] != '[' or text[text.len - 1] != ']') return error.BadOperand;
+    const inner = std.mem.trim(u8, text[1 .. text.len - 1], " \t");
+
+    const sign_at = std.mem.indexOfAny(u8, inner, "+-");
+    const base_text = if (sign_at) |i| std.mem.trim(u8, inner[0..i], " \t") else inner;
+    const base = try reg(base_text);
+
+    var offset: i64 = 0;
+    if (sign_at) |i| {
+        const n = try number(std.mem.trim(u8, inner[i + 1 ..], " \t"), 0, 32768);
+        offset = if (inner[i] == '-') -n else n;
+    }
+    if (offset < -32768 or offset > 32767) return error.ImmediateOutOfRange;
+    return .{ .base = base, .offset = @intCast(offset) };
+}
+
+fn asmMem(m: MemOp, args: []const []const u8) AsmError!u32 {
+    try needOperands(args, 2);
+    const r = try reg(args[0]);
+    const mem = try parseMem(args[1]);
+    if (m.store) return emu.storeT(m.op, r, mem.base, mem.offset);
+    return emu.loadT(m.op, r, mem.base, mem.offset);
+}
+
+const Branch = struct { name: []const u8, op: emu.Opcode, swap: bool };
+const branches = [_]Branch{
+    .{ .name = "beq", .op = .beq, .swap = false },
+    .{ .name = "bne", .op = .bne, .swap = false },
+    .{ .name = "blt", .op = .blt, .swap = false },
+    .{ .name = "bge", .op = .bge, .swap = false },
+    .{ .name = "bltu", .op = .bltu, .swap = false },
+    .{ .name = "bgeu", .op = .bgeu, .swap = false },
+    // Aliases: the same branch with its two registers swapped.
+    .{ .name = "bgt", .op = .blt, .swap = true },
+    .{ .name = "ble", .op = .bge, .swap = true },
+    .{ .name = "bgtu", .op = .bltu, .swap = true },
+    .{ .name = "bleu", .op = .bgeu, .swap = true },
+};
+
+fn asmBranch(br: Branch, args: []const []const u8) AsmError!u32 {
+    try needOperands(args, 3);
+    var left = try reg(args[0]);
+    var right = try reg(args[1]);
+    if (br.swap) std.mem.swap(u5, &left, &right);
+    const offset = try number(args[2], -32768, 32767);
+    return emu.iT(br.op, left, right, @intCast(offset));
+}
+
+fn asmBranchZero(op: emu.Opcode, args: []const []const u8) AsmError!u32 {
+    try needOperands(args, 2);
+    const r = try reg(args[0]);
+    const offset = try number(args[1], -32768, 32767);
+    return emu.iT(op, r, 0, @intCast(offset));
+}
+
 pub fn assembleLine(line: []const u8) AsmError!u32 {
     var text = line;
     if (std.mem.indexOfScalar(u8, text, ';')) |i| text = text[0..i];
@@ -74,14 +175,43 @@ pub fn assembleLine(line: []const u8) AsmError!u32 {
             count += 1;
         }
     }
+    const args = ops[0..count];
 
-    const func = aluFunc(mnemonic) orelse return error.UnknownMnemonic;
-    if (count != 2) return error.WrongOperandCount;
+    if (aluFunc(mnemonic)) |func| return asmAlu(func, args);
+    for (mem_ops) |m| if (is(m.name, mnemonic)) return asmMem(m, args);
+    for (branches) |br| if (is(br.name, mnemonic)) return asmBranch(br, args);
 
-    const dst = parseReg(ops[0]) orelse return error.BadRegister;
-    if (parseReg(ops[1])) |src| return emu.aluReg(func, dst, src);
+    if (is(mnemonic, "bz")) return asmBranchZero(.beq, args);
+    if (is(mnemonic, "bnz")) return asmBranchZero(.bne, args);
 
-    const imm = parseNumber(ops[1]) orelse return error.BadOperand;
-    if (imm < -16384 or imm > 16383) return error.ImmediateOutOfRange;
-    return emu.aluImm(func, dst, @intCast(imm));
+    if (is(mnemonic, "halt")) {
+        try needOperands(args, 0);
+        return emu.ebreak();
+    }
+
+    if (is(mnemonic, "ret")) {
+        try needOperands(args, 0);
+        return emu.iT(.jalr, 0, 1, 0); // jump to the address in ra
+    }
+
+    if (is(mnemonic, "jmpr")) {
+        try needOperands(args, 1);
+        return emu.iT(.jalr, 0, try reg(args[0]), 0);
+    }
+
+    if (is(mnemonic, "jmp")) { // jmp offset: counts instructions, from the jmp itself
+        try needOperands(args, 1);
+        const offset = try number(args[0], -1048576, 1048575);
+        return emu.lT(.jal, 0, @intCast(offset));
+    }
+
+    if (is(mnemonic, "hi") or is(mnemonic, "pchi")) {
+        try needOperands(args, 2);
+        const rd = try reg(args[0]);
+        const imm = try number(args[1], -1048576, 1048575);
+        const op: emu.Opcode = if (is(mnemonic, "hi")) .hi else .pchi;
+        return emu.lT(op, rd, @intCast(imm));
+    }
+
+    return error.UnknownMnemonic;
 }
