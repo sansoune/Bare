@@ -1,4 +1,5 @@
 const std = @import("std");
+const assembler = @import("assembler.zig");
 
 pub const Opcode = enum(u6) {
     illegal = 0x00, // an all-zero word must never run
@@ -300,9 +301,18 @@ pub fn main() void {
     var ram: [4096]u8 = @splat(0);
     var cpu = Cpu.init(&ram);
 
+    const word = assembler.assembleLine("mov a2, 128") catch |err| switch (err) {
+        // error.EmptyLine => continue,
+        else => {
+            std.debug.print("line {d}: {s}: {s}\n", .{ 1, @errorName(err), "1" });
+            return;
+        },
+    };
+
     const prog = [_]u32{
         lT(.hi, a0, 0x2000), //      0: a0 = 0x2000 << 15 = the UART address
-        aluImm(.mov, a2, 128), //    1: a2 = address of the string
+        //aluImm(.mov, a2, 128), //    1: a2 = address of the string
+        word,
         loadT(.lbu, a1, a2, 0), //   2: loop: a1 = byte at [a2]
         iT(.beq, a1, zero, 4), //    3: if a1 == 0 goto 7 (done)
         storeT(.sb, a1, a0, 0), //   4: write a1 to the UART
