@@ -301,32 +301,16 @@ pub fn main() void {
     var ram: [4096]u8 = @splat(0);
     var cpu = Cpu.init(&ram);
 
-    const source =
-        \\        li a0, 100000      ; too big for one instruction: becomes hi + add
-        \\        call double        ; a0 = a0 * 2
-        \\        call double        ; a0 = a0 * 2 again
-        \\        la t0, finish      ; t0 = the address of `finish`
-        \\        jmpr t0            ; jump there by address
-        \\        mov a0, 7          ; skipped
-        \\finish: nop
-        \\        halt
-        \\double: add a0, a0         ; the subroutine: only reached by `call`
-        \\        ret    
-    ;
+    const source = @embedFile("programs/hello.s");
 
-    var words: [256]u32 = undefined;
     var bad_line: usize = 0;
-    const count = assembler.assemble(source, &words, &bad_line) catch |err| {
+    const size = assembler.assembleBytes(source, &ram, &bad_line) catch |err| {
         std.debug.print("line {d}: {s}\n", .{ bad_line, @errorName(err) });
         return;
     };
-    for (words[0..count], 0..) |w, i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], w, .little);
-
-    const msg = "Hello from BARE64!\n\x00";
-    @memcpy(ram[128..][0..msg.len], msg[0..msg.len]);
 
     var steps: usize = 0;
     while (!cpu.halted and steps < 1000) : (steps += 1) cpu.step();
 
-    std.debug.print("a0 = {d}, t0 = {d}, words = {d}, steps = {d}\n", .{ cpu.getReg(a0), cpu.getReg(12), count, steps });
+    std.debug.print("a0 = {d}, a1 = {d}, bytes = {d}, steps = {d}\n", .{ cpu.getReg(a0), cpu.getReg(a1), size, steps });
 }

@@ -15,6 +15,9 @@ pub const AsmError = error{
     BadLabel, // a label must start with a letter or _ and contain only letters, digits, _ or .
     ProgramTooLong, // the output buffer is too small
     NeedsProgram,
+    UnknownDirective, // a line starting with . that we do not know
+    MisalignedInstruction, // code must start at a multiple of 4: put `.align 4` after odd-sized data
+    MisalignedLabel,
 };
 
 const reg_names = [32][]const u8{
@@ -79,6 +82,26 @@ fn number(text: []const u8, min_v: i64, max_v: i64) AsmError!i64 {
     return n;
 }
 
+fn stripComment(line: []const u8) []const u8 {
+    var quote: u8 = 0; // 0 = outside quotes, otherwise the quote character we are inside
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        const c = line[i];
+        if (quote != 0) {
+            if (c == '\\') {
+                i += 1; // skip the escaped character
+            } else if (c == quote) {
+                quote = 0;
+            }
+        } else if (c == '"' or c == '\'') {
+            quote = c;
+        } else if (c == ';') {
+            return line[0..i];
+        }
+    }
+    return line;
+}
+
 const max_labels = 64;
 
 /// Label names and the instruction index each one points at.
@@ -104,7 +127,7 @@ const Labels = struct {
 };
 
 /// Where we are in a whole program: the current instruction's index and the labels.
-const Context = struct { index: usize, labels: *const Labels };
+const Context = struct { address: usize, labels: *const Labels };
 
 fn validLabelName(name: []const u8) bool {
     if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
@@ -121,8 +144,10 @@ fn offsetOperand(text: []const u8, ctx: ?Context, min_v: i64, max_v: i64) AsmErr
     const c = ctx orelse return error.BadOperand; // one line alone: only numbers
     if (!validLabelName(text)) return error.BadOperand;
     const target = c.labels.find(text) orelse return error.UnknownLabel;
+    if (target % 4 != 0) return error.MisalignedLabel;
 
-    const distance = @as(i64, @intCast(target)) - @as(i64, @intCast(c.index));
+    // Both addresses are multiples of 4, so the shift is exact.
+    const distance = (@as(i64, @intCast(target)) - @as(i64, @intCast(c.address))) >> 2;
     if (distance < min_v or distance > max_v) return error.ImmediateOutOfRange;
     return distance;
 }
@@ -150,7 +175,7 @@ fn emitLa(args: []const []const u8, ctx: ?Context, out: *[2]u32) AsmError!usize 
     const target = c.labels.find(args[1]) orelse return error.UnknownLabel;
 
     // The distance from this instruction to the label, in bytes.
-    const bytes = (@as(i64, @intCast(target)) - @as(i64, @intCast(c.index))) * 4;
+    const bytes = @as(i64, @intCast(target)) - @as(i64, @intCast(c.address));
     const upper = (bytes + 16384) >> 15;
     const lower = bytes - (upper << 15);
     if (upper < -1048576 or upper > 1048575) return error.ImmediateOutOfRange;
@@ -252,8 +277,7 @@ const Parsed = struct { mnemonic: []const u8, ops: [4][]const u8, count: usize }
 
 fn parseLine(line: []const u8) AsmError!Parsed {
     // Clean: drop the comment and the spaces around the line.
-    var text = line;
-    if (std.mem.indexOfScalar(u8, text, ';')) |i| text = text[0..i];
+    var text = stripComment(line);
     text = std.mem.trim(u8, text, " \t\r");
     if (text.len == 0) return error.EmptyLine;
 
@@ -351,9 +375,7 @@ fn wordCount(code: []const u8) AsmError!usize {
 const Parts = struct { label: ?[]const u8, code: []const u8 };
 
 fn splitLabel(line: []const u8) AsmError!Parts {
-    var text = line;
-    if (std.mem.indexOfScalar(u8, text, ';')) |i| text = text[0..i];
-    text = std.mem.trim(u8, text, " \t\r");
+    const text = std.mem.trim(u8, stripComment(line), " \t\r");
 
     const split = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
     const first = text[0..split];
@@ -365,25 +387,122 @@ fn splitLabel(line: []const u8) AsmError!Parts {
     return .{ .label = null, .code = text };
 }
 
-pub fn assemble(source: []const u8, out: []u32, bad_line: *usize) AsmError!usize {
+fn isDirective(code: []const u8) bool {
+    return code.len > 0 and code[0] == '.';
+}
+
+fn put(out: ?[]u8, at: usize, byte: u8) AsmError!void {
+    if (out) |o| {
+        if (at >= o.len) return error.ProgramTooLong;
+        o[at] = byte;
+    }
+}
+
+fn fitsSize(v: i64, size: usize) bool {
+    return switch (size) {
+        1 => v >= -128 and v <= 255,
+        2 => v >= -32768 and v <= 65535,
+        4 => v >= -2147483648 and v <= 4294967295,
+        else => true,
+    };
+}
+
+fn emitNumbers(rest: []const u8, size: usize, pos: usize, out: ?[]u8) AsmError!usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, rest, ',');
+    while (it.next()) |piece| {
+        const text = std.mem.trim(u8, piece, " \t");
+        const v = parseNumber(text) orelse return error.BadOperand;
+        if (!fitsSize(v, size)) return error.ImmediateOutOfRange;
+        const bits: u64 = @bitCast(v);
+        for (0..size) |k| try put(out, pos + n + k, @truncate(bits >> @intCast(8 * k)));
+        n += size;
+    }
+    return n;
+}
+
+fn emitString(rest: []const u8, zero_end: bool, pos: usize, out: ?[]u8) AsmError!usize {
+    if (rest.len < 2 or rest[0] != '"' or rest[rest.len - 1] != '"') return error.BadOperand;
+    const body = rest[1 .. rest.len - 1];
+
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        var c = body[i];
+        if (c == '\\') {
+            i += 1;
+            if (i == body.len) return error.BadOperand;
+            c = switch (body[i]) {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '0' => 0,
+                '\\' => '\\',
+                '"' => '"',
+                else => return error.BadOperand,
+            };
+        }
+        try put(out, pos + n, c);
+        n += 1;
+    }
+    if (zero_end) {
+        try put(out, pos + n, 0);
+        n += 1;
+    }
+    return n;
+}
+
+fn emitDirective(code: []const u8, pos: usize, out: ?[]u8) AsmError!usize {
+    const split = std.mem.indexOfAny(u8, code, " \t") orelse code.len;
+    const name = code[0..split];
+    const rest = std.mem.trim(u8, code[split..], " \t");
+
+    if (is(name, ".byte")) return emitNumbers(rest, 1, pos, out);
+    if (is(name, ".half")) return emitNumbers(rest, 2, pos, out);
+    if (is(name, ".word")) return emitNumbers(rest, 4, pos, out);
+    if (is(name, ".dword")) return emitNumbers(rest, 8, pos, out);
+    if (is(name, ".ascii")) return emitString(rest, false, pos, out);
+    if (is(name, ".asciz")) return emitString(rest, true, pos, out);
+    if (is(name, ".space")) {
+        const n: usize = @intCast(try number(rest, 0, 1 << 20));
+        for (0..n) |i| try put(out, pos + i, 0);
+        return n;
+    }
+    if (is(name, ".align")) {
+        const a: usize = @intCast(try number(rest, 1, 4096));
+        const rem = pos % a;
+        const pad = if (rem == 0) 0 else a - rem;
+        for (0..pad) |i| try put(out, pos + i, 0);
+        return pad;
+    }
+    return error.UnknownDirective;
+}
+
+pub fn assembleBytes(source: []const u8, out: []u8, bad_line: *usize) AsmError!usize {
     var labels = Labels{};
 
-    // Pass 1: find where every label points. A line can be more than one
-    // instruction (li, la), so count words, not lines.
-    var index: usize = 0;
+    // Pass 1: find where every label points (a byte address), by measuring each line.
+    var pos: usize = 0;
     var line_no: usize = 0;
     var lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw| {
         line_no += 1;
         bad_line.* = line_no;
         const parts = try splitLabel(raw);
-        if (parts.label) |name| try labels.add(name, index);
-        if (parts.code.len > 0) index += try wordCount(parts.code);
+        if (parts.label) |name| try labels.add(name, pos);
+        if (parts.code.len == 0) continue;
+        if (isDirective(parts.code)) {
+            pos += try emitDirective(parts.code, pos, null);
+        } else {
+            if (pos % 4 != 0) return error.MisalignedInstruction;
+            const words = try wordCount(parts.code);
+            pos += 4 * words;
+        }
     }
 
-    // Pass 2: assemble every instruction, with the labels known.
-    var count: usize = 0;
+    // Pass 2: emit the bytes, with every label known.
     var tmp: [2]u32 = undefined;
+    pos = 0;
     line_no = 0;
     lines = std.mem.splitScalar(u8, source, '\n');
     while (lines.next()) |raw| {
@@ -391,10 +510,19 @@ pub fn assemble(source: []const u8, out: []u32, bad_line: *usize) AsmError!usize
         bad_line.* = line_no;
         const parts = try splitLabel(raw);
         if (parts.code.len == 0) continue;
-        const n = try assembleInstruction(parts.code, .{ .index = count, .labels = &labels }, &tmp);
-        if (count + n > out.len) return error.ProgramTooLong;
-        @memcpy(out[count..][0..n], tmp[0..n]);
-        count += n;
+        if (isDirective(parts.code)) {
+            pos += try emitDirective(parts.code, pos, out);
+        } else {
+            const n = try assembleInstruction(parts.code, .{ .address = pos, .labels = &labels }, &tmp);
+            if (pos + 4 * n > out.len) return error.ProgramTooLong;
+            for (tmp[0..n], 0..) |w, k| std.mem.writeInt(u32, out[pos + 4 * k ..][0..4], w, .little);
+            pos += 4 * n;
+        }
     }
-    return count;
+    return pos;
+}
+
+pub fn assemble(source: []const u8, out: []u32, bad_line: *usize) AsmError!usize {
+    const bytes = try assembleBytes(source, std.mem.sliceAsBytes(out), bad_line);
+    return (bytes + 3) / 4;
 }
