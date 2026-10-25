@@ -9,6 +9,12 @@ pub const AsmError = error{
     BadRegister, // the destination is not a register name
     BadOperand, // the second operand is neither a register nor a number
     ImmediateOutOfRange, // does not fit in a signed 15-bit number
+    UnknownLabel, // a jump names a label that does not exist
+    DuplicateLabel, // the same label is defined twice
+    TooManyLabels, // more than 64 labels
+    BadLabel, // a label must start with a letter or _ and contain only letters, digits, _ or .
+    ProgramTooLong, // the output buffer is too small
+    NeedsProgram,
 };
 
 const reg_names = [32][]const u8{
@@ -71,6 +77,86 @@ fn number(text: []const u8, min_v: i64, max_v: i64) AsmError!i64 {
     const n = parseNumber(text) orelse return error.BadOperand;
     if (n < min_v or n > max_v) return error.ImmediateOutOfRange;
     return n;
+}
+
+const max_labels = 64;
+
+/// Label names and the instruction index each one points at.
+const Labels = struct {
+    names: [max_labels][]const u8 = undefined,
+    indexes: [max_labels]usize = undefined,
+    count: usize = 0,
+
+    fn add(self: *Labels, name: []const u8, index: usize) AsmError!void {
+        if (self.find(name) != null) return error.DuplicateLabel;
+        if (self.count == max_labels) return error.TooManyLabels;
+        self.names[self.count] = name;
+        self.indexes[self.count] = index;
+        self.count += 1;
+    }
+
+    fn find(self: *const Labels, name: []const u8) ?usize {
+        for (self.names[0..self.count], self.indexes[0..self.count]) |n, i| {
+            if (std.mem.eql(u8, n, name)) return i;
+        }
+        return null;
+    }
+};
+
+/// Where we are in a whole program: the current instruction's index and the labels.
+const Context = struct { index: usize, labels: *const Labels };
+
+fn validLabelName(name: []const u8) bool {
+    if (name.len == 0 or std.ascii.isDigit(name[0])) return false;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '.') return false;
+    }
+    return true;
+}
+
+/// A jump distance, in instructions: either a plain number or a label name.
+fn offsetOperand(text: []const u8, ctx: ?Context, min_v: i64, max_v: i64) AsmError!i64 {
+    if (parseNumber(text) != null) return number(text, min_v, max_v);
+
+    const c = ctx orelse return error.BadOperand; // one line alone: only numbers
+    if (!validLabelName(text)) return error.BadOperand;
+    const target = c.labels.find(text) orelse return error.UnknownLabel;
+
+    const distance = @as(i64, @intCast(target)) - @as(i64, @intCast(c.index));
+    if (distance < min_v or distance > max_v) return error.ImmediateOutOfRange;
+    return distance;
+}
+
+fn encodeLi(rd: u5, v: i64, out: *[2]u32) AsmError!usize {
+    if (v >= -16384 and v <= 16383) {
+        out[0] = emu.aluImm(.mov, rd, @intCast(v));
+        return 1;
+    }
+    if (v < -(1 << 36) or v > (1 << 36)) return error.ImmediateOutOfRange;
+    const upper = (v + 16384) >> 15; // rounded, so that `lower` fits a signed 15-bit number
+    const lower = v - (upper << 15);
+    if (upper < -1048576 or upper > 1048575) return error.ImmediateOutOfRange;
+    out[0] = emu.lT(.hi, rd, @intCast(upper));
+    if (lower == 0) return 1;
+    out[1] = emu.aluImm(.add, rd, @intCast(lower));
+    return 2;
+}
+
+fn emitLa(args: []const []const u8, ctx: ?Context, out: *[2]u32) AsmError!usize {
+    try needOperands(args, 2);
+    const rd = try reg(args[0]);
+    const c = ctx orelse return error.NeedsProgram;
+    if (!validLabelName(args[1])) return error.BadOperand;
+    const target = c.labels.find(args[1]) orelse return error.UnknownLabel;
+
+    // The distance from this instruction to the label, in bytes.
+    const bytes = (@as(i64, @intCast(target)) - @as(i64, @intCast(c.index))) * 4;
+    const upper = (bytes + 16384) >> 15;
+    const lower = bytes - (upper << 15);
+    if (upper < -1048576 or upper > 1048575) return error.ImmediateOutOfRange;
+    out[0] = emu.lT(.pchi, rd, @intCast(upper));
+    out[1] = emu.aluImm(.add, rd, @intCast(lower));
+    return 2;
 }
 
 fn asmAlu(func: emu.Func, args: []const []const u8) AsmError!u32 {
@@ -139,72 +225,87 @@ const branches = [_]Branch{
     .{ .name = "bleu", .op = .bgeu, .swap = true },
 };
 
-fn asmBranch(br: Branch, args: []const []const u8) AsmError!u32 {
+fn asmBranch(br: Branch, args: []const []const u8, ctx: ?Context) AsmError!u32 {
     try needOperands(args, 3);
     var left = try reg(args[0]);
     var right = try reg(args[1]);
     if (br.swap) std.mem.swap(u5, &left, &right);
-    const offset = try number(args[2], -32768, 32767);
+    const offset = try offsetOperand(args[2], ctx, -32768, 32767);
     return emu.iT(br.op, left, right, @intCast(offset));
 }
 
-fn asmBranchZero(op: emu.Opcode, args: []const []const u8) AsmError!u32 {
+fn asmBranchZero(op: emu.Opcode, args: []const []const u8, ctx: ?Context) AsmError!u32 {
     try needOperands(args, 2);
     const r = try reg(args[0]);
-    const offset = try number(args[1], -32768, 32767);
+    const offset = try offsetOperand(args[1], ctx, -32768, 32767);
     return emu.iT(op, r, 0, @intCast(offset));
 }
 
 pub fn assembleLine(line: []const u8) AsmError!u32 {
+    var words: [2]u32 = undefined;
+    const n = try assembleInstruction(line, null, &words);
+    if (n != 1) return error.NeedsProgram;
+    return words[0];
+}
+
+const Parsed = struct { mnemonic: []const u8, ops: [4][]const u8, count: usize };
+
+fn parseLine(line: []const u8) AsmError!Parsed {
+    // Clean: drop the comment and the spaces around the line.
     var text = line;
     if (std.mem.indexOfScalar(u8, text, ';')) |i| text = text[0..i];
     text = std.mem.trim(u8, text, " \t\r");
     if (text.len == 0) return error.EmptyLine;
 
+    // Split: "mnemonic operand, operand, ...".
     const split = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
-    const mnemonic = text[0..split];
+    var p: Parsed = .{ .mnemonic = text[0..split], .ops = undefined, .count = 0 };
     const rest = std.mem.trim(u8, text[split..], " \t");
-
-    var ops: [4][]const u8 = undefined;
-    var count: usize = 0;
     if (rest.len > 0) {
         var it = std.mem.splitScalar(u8, rest, ',');
         while (it.next()) |piece| {
-            if (count == ops.len) return error.TooManyOperands;
-            ops[count] = std.mem.trim(u8, piece, " \t");
-            count += 1;
+            if (p.count == p.ops.len) return error.TooManyOperands;
+            p.ops[p.count] = std.mem.trim(u8, piece, " \t");
+            p.count += 1;
         }
     }
-    const args = ops[0..count];
+    return p;
+}
 
+fn assembleSingle(mnemonic: []const u8, args: []const []const u8, ctx: ?Context) AsmError!u32 {
     if (aluFunc(mnemonic)) |func| return asmAlu(func, args);
     for (mem_ops) |m| if (is(m.name, mnemonic)) return asmMem(m, args);
-    for (branches) |br| if (is(br.name, mnemonic)) return asmBranch(br, args);
+    for (branches) |br| if (is(br.name, mnemonic)) return asmBranch(br, args, ctx);
 
-    if (is(mnemonic, "bz")) return asmBranchZero(.beq, args);
-    if (is(mnemonic, "bnz")) return asmBranchZero(.bne, args);
+    if (is(mnemonic, "bz")) return asmBranchZero(.beq, args, ctx);
+    if (is(mnemonic, "bnz")) return asmBranchZero(.bne, args, ctx);
 
+    if (is(mnemonic, "nop")) {
+        try needOperands(args, 0);
+        return emu.aluImm(.mov, 0, 0); // mov zero, 0: writes nothing anywhere
+    }
     if (is(mnemonic, "halt")) {
         try needOperands(args, 0);
         return emu.ebreak();
     }
-
     if (is(mnemonic, "ret")) {
         try needOperands(args, 0);
         return emu.iT(.jalr, 0, 1, 0); // jump to the address in ra
     }
-
     if (is(mnemonic, "jmpr")) {
         try needOperands(args, 1);
         return emu.iT(.jalr, 0, try reg(args[0]), 0);
     }
-
-    if (is(mnemonic, "jmp")) { // jmp offset: counts instructions, from the jmp itself
+    if (is(mnemonic, "jmp")) { // jmp label, or jmp N (instructions, from the jmp itself)
         try needOperands(args, 1);
-        const offset = try number(args[0], -1048576, 1048575);
+        const offset = try offsetOperand(args[0], ctx, -1048576, 1048575);
         return emu.lT(.jal, 0, @intCast(offset));
     }
-
+    if (is(mnemonic, "call")) { // like jmp, but leaves the return address in ra
+        try needOperands(args, 1);
+        const offset = try offsetOperand(args[0], ctx, -1048576, 1048575);
+        return emu.lT(.jal, 1, @intCast(offset));
+    }
     if (is(mnemonic, "hi") or is(mnemonic, "pchi")) {
         try needOperands(args, 2);
         const rd = try reg(args[0]);
@@ -214,4 +315,86 @@ pub fn assembleLine(line: []const u8) AsmError!u32 {
     }
 
     return error.UnknownMnemonic;
+}
+
+fn assembleInstruction(code: []const u8, ctx: ?Context, out: *[2]u32) AsmError!usize {
+    const p = try parseLine(code);
+    const args = p.ops[0..p.count];
+
+    if (is(p.mnemonic, "li")) {
+        try needOperands(args, 2);
+        const rd = try reg(args[0]);
+        const value = try number(args[1], std.math.minInt(i64), std.math.maxInt(i64));
+        return encodeLi(rd, value, out);
+    }
+    if (is(p.mnemonic, "la")) return emitLa(args, ctx, out);
+
+    out[0] = try assembleSingle(p.mnemonic, args, ctx);
+    return 1;
+}
+
+fn wordCount(code: []const u8) AsmError!usize {
+    const p = try parseLine(code);
+    const args = p.ops[0..p.count];
+
+    if (is(p.mnemonic, "li")) {
+        try needOperands(args, 2);
+        const rd = try reg(args[0]);
+        const value = try number(args[1], std.math.minInt(i64), std.math.maxInt(i64));
+        var scratch: [2]u32 = undefined;
+        return encodeLi(rd, value, &scratch);
+    }
+    if (is(p.mnemonic, "la")) return 2;
+    return 1;
+}
+
+const Parts = struct { label: ?[]const u8, code: []const u8 };
+
+fn splitLabel(line: []const u8) AsmError!Parts {
+    var text = line;
+    if (std.mem.indexOfScalar(u8, text, ';')) |i| text = text[0..i];
+    text = std.mem.trim(u8, text, " \t\r");
+
+    const split = std.mem.indexOfAny(u8, text, " \t") orelse text.len;
+    const first = text[0..split];
+    if (first.len > 0 and first[first.len - 1] == ':') {
+        const name = first[0 .. first.len - 1];
+        if (!validLabelName(name)) return error.BadLabel;
+        return .{ .label = name, .code = std.mem.trim(u8, text[split..], " \t") };
+    }
+    return .{ .label = null, .code = text };
+}
+
+pub fn assemble(source: []const u8, out: []u32, bad_line: *usize) AsmError!usize {
+    var labels = Labels{};
+
+    // Pass 1: find where every label points. A line can be more than one
+    // instruction (li, la), so count words, not lines.
+    var index: usize = 0;
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        line_no += 1;
+        bad_line.* = line_no;
+        const parts = try splitLabel(raw);
+        if (parts.label) |name| try labels.add(name, index);
+        if (parts.code.len > 0) index += try wordCount(parts.code);
+    }
+
+    // Pass 2: assemble every instruction, with the labels known.
+    var count: usize = 0;
+    var tmp: [2]u32 = undefined;
+    line_no = 0;
+    lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw| {
+        line_no += 1;
+        bad_line.* = line_no;
+        const parts = try splitLabel(raw);
+        if (parts.code.len == 0) continue;
+        const n = try assembleInstruction(parts.code, .{ .index = count, .labels = &labels }, &tmp);
+        if (count + n > out.len) return error.ProgramTooLong;
+        @memcpy(out[count..][0..n], tmp[0..n]);
+        count += n;
+    }
+    return count;
 }

@@ -301,26 +301,26 @@ pub fn main() void {
     var ram: [4096]u8 = @splat(0);
     var cpu = Cpu.init(&ram);
 
-    const word = assembler.assembleLine("mov a2, 128") catch |err| switch (err) {
-        // error.EmptyLine => continue,
-        else => {
-            std.debug.print("line {d}: {s}: {s}\n", .{ 1, @errorName(err), "1" });
-            return;
-        },
-    };
+    const source =
+        \\        li a0, 100000      ; too big for one instruction: becomes hi + add
+        \\        call double        ; a0 = a0 * 2
+        \\        call double        ; a0 = a0 * 2 again
+        \\        la t0, finish      ; t0 = the address of `finish`
+        \\        jmpr t0            ; jump there by address
+        \\        mov a0, 7          ; skipped
+        \\finish: nop
+        \\        halt
+        \\double: add a0, a0         ; the subroutine: only reached by `call`
+        \\        ret    
+    ;
 
-    const prog = [_]u32{
-        lT(.hi, a0, 0x2000), //      0: a0 = 0x2000 << 15 = the UART address
-        //aluImm(.mov, a2, 128), //    1: a2 = address of the string
-        word,
-        loadT(.lbu, a1, a2, 0), //   2: loop: a1 = byte at [a2]
-        iT(.beq, a1, zero, 4), //    3: if a1 == 0 goto 7 (done)
-        storeT(.sb, a1, a0, 0), //   4: write a1 to the UART
-        aluImm(.add, a2, 1), //      5: a2 += 1
-        lT(.jal, zero, -4), //       6: goto 2
-        ebreak(), //                 7: done
+    var words: [256]u32 = undefined;
+    var bad_line: usize = 0;
+    const count = assembler.assemble(source, &words, &bad_line) catch |err| {
+        std.debug.print("line {d}: {s}\n", .{ bad_line, @errorName(err) });
+        return;
     };
-    for (prog, 0..) |w, i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], w, .little);
+    for (words[0..count], 0..) |w, i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], w, .little);
 
     const msg = "Hello from BARE64!\n\x00";
     @memcpy(ram[128..][0..msg.len], msg[0..msg.len]);
@@ -328,5 +328,5 @@ pub fn main() void {
     var steps: usize = 0;
     while (!cpu.halted and steps < 1000) : (steps += 1) cpu.step();
 
-    std.debug.print("steps = {d}\n", .{steps});
+    std.debug.print("a0 = {d}, t0 = {d}, words = {d}, steps = {d}\n", .{ cpu.getReg(a0), cpu.getReg(12), count, steps });
 }
