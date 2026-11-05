@@ -6,7 +6,7 @@ default:
 
 # Runs the emulator
 run-emu file:
-  zig run ./emulator/emu.zig -- {{file}}
+  zig build run -- {{file}}
 
-test:
-  zig build test --summary all
+test filter="":
+  zig build test --summary all {{ if filter == "" { "" } else { "-Dfilter=" + filter } }}
