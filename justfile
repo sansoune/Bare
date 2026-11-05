@@ -5,8 +5,8 @@ default:
   @just --list
 
 # Runs the emulator
-run-emu:
-  zig run ./emulator/emu.zig
+run-emu file:
+  zig run ./emulator/emu.zig -- {{file}}
 
 test:
   zig build test --summary all

@@ -153,7 +153,7 @@ pub const Cpu = struct {
     pub fn step(self: *Cpu) void {
         const inst = self.fetch();
 
-        const op: Opcode = @enumFromInt(@as(u6, @truncate(inst >> 26)));
+        const op: Opcode = @fromBackingInt(@intCast(@as(u6, @truncate(inst >> 26))));
         const a: u5 = @truncate(inst >> 21);
         const b: u5 = @truncate(inst >> 16);
         const funct: u5 = @truncate(inst >> 16);
@@ -173,7 +173,7 @@ pub const Cpu = struct {
             .alu => {
                 const x = self.getReg(a);
                 const y: u64 = if (is_imm) @bitCast(simm15) else self.getReg(@as(u5, @truncate(src)));
-                const func: Func = @enumFromInt(funct);
+                const func: Func = @fromBackingInt(@intCast(funct));
                 const sx: i64 = @bitCast(x);
                 const sy: i64 = @bitCast(y);
                 const sh: u6 = @truncate(y);
@@ -257,7 +257,7 @@ pub const Cpu = struct {
             },
             .priv => {
                 // Temporary: ebreak just stops the machine for now.
-                const pf: Priv = @enumFromInt(funct);
+                const pf: Priv = @fromBackingInt(@intCast(funct));
                 if (pf == .ebreak) self.halted = true else self.illegal(inst);
             },
             else => self.illegal(inst),
@@ -268,20 +268,20 @@ pub const Cpu = struct {
 };
 
 pub fn aluReg(f: Func, dst: u32, src: u32) u32 { // dst = dst <f> register
-    return (@as(u32, @intFromEnum(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @intFromEnum(f)) << 16) | src;
+    return (@as(u32, @backingInt(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @backingInt(f)) << 16) | src;
 }
 pub fn aluImm(f: Func, dst: u32, imm: i32) u32 { // dst = dst <f> immediate
-    return (@as(u32, @intFromEnum(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @intFromEnum(f)) << 16) | (1 << 15) | (@as(u32, @bitCast(imm)) & 0x7FFF);
+    return (@as(u32, @backingInt(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @backingInt(f)) << 16) | (1 << 15) | (@as(u32, @bitCast(imm)) & 0x7FFF);
 }
 pub fn iT(op: Opcode, a: u32, b: u32, imm: i32) u32 {
-    return (@as(u32, @intFromEnum(op)) << 26) | (a << 21) | (b << 16) | (@as(u32, @bitCast(imm)) & 0xFFFF);
+    return (@as(u32, @backingInt(op)) << 26) | (a << 21) | (b << 16) | (@as(u32, @bitCast(imm)) & 0xFFFF);
 }
 pub fn ebreak() u32 {
-    return (@as(u32, @intFromEnum(Opcode.priv)) << 26) | (@as(u32, @intFromEnum(Priv.ebreak)) << 16);
+    return (@as(u32, @backingInt(Opcode.priv)) << 26) | (@as(u32, @backingInt(Priv.ebreak)) << 16);
 }
 
 pub fn lT(op: Opcode, rd: u32, imm: i32) u32 {
-    return (@as(u32, @intFromEnum(op)) << 26) | (rd << 21) | (@as(u32, @bitCast(imm)) & 0x1FFFFF);
+    return (@as(u32, @backingInt(op)) << 26) | (rd << 21) | (@as(u32, @bitCast(imm)) & 0x1FFFFF);
 }
 
 pub fn loadT(op: Opcode, rd: u32, base: u32, offset: i32) u32 {
@@ -297,11 +297,22 @@ const a0 = 4;
 const a1 = 5;
 const a2 = 6;
 
-pub fn main() void {
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+
+    var args = try init.minimal.args.iterateAllocator(gpa);
+    defer args.deinit();
+    _ = args.skip();
+    const path = args.next() orelse {
+        std.debug.print("usage: emu <program.s\n>", .{});
+        return;
+    };
+
+    const source = try std.Io.Dir.cwd().readFileAlloc(init.io, path, gpa, .limited(1 << 20));
+    defer gpa.free(source);
+
     var ram: [4096]u8 = @splat(0);
     var cpu = Cpu.init(&ram);
-
-    const source = @embedFile("programs/hello.s");
 
     var bad_line: usize = 0;
     const size = assembler.assembleBytes(source, &ram, &bad_line) catch |err| {
