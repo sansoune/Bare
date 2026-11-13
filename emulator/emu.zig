@@ -1,5 +1,5 @@
 const std = @import("std");
-const assembler = @import("assembler.zig");
+pub const assembler = @import("assembler.zig");
 
 pub const Opcode = enum(u6) {
     illegal = 0x00, // an all-zero word must never run

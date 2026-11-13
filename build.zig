@@ -18,8 +18,17 @@ pub fn build(b: *std.Build) void {
     const filter = b.option([]const u8, "filter", "Only run tests whose name contains this");
     const test_step = b.step("test", "Run all tests");
 
-    const test_files = [_][]const u8{ "emu", "assembler" };
-    for (test_files) |name| {
+    b.dependOnDirectoryContents(b.path("test"));
+
+    const io = b.graph.io;
+    var dir = b.root.root_dir.handle.openDir(io, "test", .{ .iterate = true }) catch |err|
+        std.debug.panic("cannot open test/: {s}", .{@errorName(err)});
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("cannot read test/: {s}", .{@errorName(err)})) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const name = entry.name[0 .. entry.name.len - ".zig".len];
         const t = b.addTest(.{
             .name = name,
             .filters = if (filter) |f| &.{f} else &.{},
