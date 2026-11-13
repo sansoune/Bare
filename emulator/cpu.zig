@@ -3,6 +3,16 @@ const uart = @import("uart.zig");
 const isa = @import("isa.zig");
 const memory = @import("memory.zig");
 
+pub const Fault = enum {
+    illegal_instruction,
+    fetch_misaligned, //    value = the pc
+    fetch_access, //        value = the pc
+    load_misaligned, //     value = the address
+    load_access, //         value = the address
+    store_misaligned, //    value = the address
+    store_access, //        value = the address
+};
+
 fn sext8(v: u64) u64 {
     const t: u8 = @truncate(v);
     return @bitCast(@as(i64, @as(i8, @bitCast(t))));
@@ -18,11 +28,15 @@ fn sext32(v: u64) u64 {
     return @bitCast(@as(i64, @as(i32, @bitCast(t))));
 }
 
+pub const FaultInfo = struct { fault: Fault, pc: u64, value: u64 };
+
 pub const Cpu = struct {
     regs: [32]u64 = @splat(0),
     pc: u64 = 0,
     mem: []u8,
     halted: bool = false,
+
+    fault: ?FaultInfo = null,
 
     uart: uart.Buffer = .{},
 
@@ -42,19 +56,31 @@ pub const Cpu = struct {
         return self.uart.text();
     }
 
-    pub fn fetch(self: *Cpu) u32 {
+    pub fn fetch(self: *Cpu) ?u32 {
+        if (self.pc & 3 != 0) {
+            self.raise(.fetch_misaligned, self.pc);
+            return null;
+        }
+
+        const mem_len: u64 = self.mem.len;
+        if (mem_len < 4 or self.pc > mem_len - 4) {
+            self.raise(.fetch_access, self.pc);
+            return null;
+        }
+
         const a: usize = @intCast(self.pc);
+
         return std.mem.readInt(u32, self.mem[a..][0..4], .little);
     }
 
     pub fn illegal(self: *Cpu, inst: u64) void {
-        std.debug.print("illegal instruction 0x{x:0>8} at pc=0x{x}\n", .{ inst, self.pc });
-        self.halted = true;
+        self.raise(.illegal_instruction, inst);
     }
 
-    fn fault(self: *Cpu, what: []const u8, value: u64) void {
-        std.debug.print("{s}: 0x{x} at pc=0x{x}\n", .{ what, value, self.pc });
+    fn raise(self: *Cpu, cause: Fault, value: u64) void {
+        self.fault = .{ .fault = cause, .pc = self.pc, .value = value };
         self.halted = true;
+        if (self.uart.echo) std.debug.print("{s}: 0x{x} at pc=0x{x}\n", .{ @tagName(cause), value, self.pc });
     }
 
     fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
@@ -72,7 +98,7 @@ pub const Cpu = struct {
     }
 
     pub fn step(self: *Cpu) void {
-        const inst = self.fetch();
+        const inst = self.fetch() orelse return;
 
         const op: isa.Opcode = @fromBackingInt(@intCast(@as(u6, @truncate(inst >> 26))));
         const a: u5 = @truncate(inst >> 21);
@@ -126,9 +152,9 @@ pub const Cpu = struct {
                     .lw, .lwu => 4,
                     else => 8,
                 };
-                if (addr & (size - 1) != 0) return self.fault("load address misaligned", addr);
+                if (addr & (size - 1) != 0) return self.raise(.load_misaligned, addr);
                 const raw = self.memLoad(addr, size) orelse
-                    return self.fault("load access fault", addr);
+                    return self.raise(.load_access, addr);
                 const v: u64 = switch (op) {
                     .lb => sext8(raw),
                     .lh => sext16(raw),
@@ -146,9 +172,9 @@ pub const Cpu = struct {
                     .sw => 4,
                     else => 8,
                 };
-                if (addr & (size - 1) != 0) return self.fault("store address misaligned", addr);
+                if (addr & (size - 1) != 0) return self.raise(.store_misaligned, addr);
                 if (!self.memStore(addr, size, self.getReg(a))) {
-                    return self.fault("store access fault", addr);
+                    return self.raise(.store_access, addr);
                 }
             },
             .beq, .bne, .blt, .bge, .bltu, .bgeu => {
@@ -184,6 +210,6 @@ pub const Cpu = struct {
             else => self.illegal(inst),
         }
 
-        self.pc = next_pc;
+        if (self.fault == null) self.pc = next_pc;
     }
 };

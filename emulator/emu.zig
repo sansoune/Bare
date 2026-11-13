@@ -16,6 +16,8 @@ pub const lT = isa.lT;
 pub const ebreak = isa.ebreak;
 pub const loadT = isa.loadT;
 pub const storeT = isa.storeT;
+pub const Fault = cpu.Fault;
+pub const FaultInfo = cpu.FaultInfo;
 
 const zero = 0;
 const a0 = 4;
