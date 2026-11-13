@@ -162,7 +162,7 @@ test "Cpu: an all-zero word is illegal" {
 test "Cpu: a reserved ALU function is illegal and changes nothing" {
     var ram: [64]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    const prog = [_]u32{ emu.aluReg(@enumFromInt(31), a0, a1), emu.ebreak() };
+    const prog = [_]u32{ emu.aluReg(@fromBackingInt(@intCast(31)), a0, a1), emu.ebreak() };
     load(&ram, &prog);
     cpu.setReg(a0, 7);
 
@@ -396,7 +396,7 @@ test "Encoder: hi word matches the hand-computed value" {
 test "Cpu: bytes written to the UART are captured" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a0, 0x2000), //      0: a0 = UART address
         emu.aluImm(.mov, a1, 'H'), //    1
@@ -414,7 +414,7 @@ test "Cpu: bytes written to the UART are captured" {
 test "Cpu: a wider store to the UART prints only the low byte" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a2, 0x2000),
         emu.aluImm(.mov, a0, 0x1234), // low byte 0x34 is '4'
@@ -430,7 +430,7 @@ test "Cpu: a wider store to the UART prints only the low byte" {
 test "Cpu: the UART status register reads 1 (ready)" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a2, 0x2000),
         emu.loadT(.lbu, a1, a2, 4), // read the status register
@@ -445,7 +445,7 @@ test "Cpu: the UART status register reads 1 (ready)" {
 test "Cpu: reading the UART transmit register faults" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a2, 0x2000),
         emu.aluImm(.mov, a1, 7),
@@ -461,7 +461,7 @@ test "Cpu: reading the UART transmit register faults" {
 test "Cpu: an address next to the UART faults and prints nothing" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a2, 0x2000),
         emu.storeT(.sb, a0, a2, 8), // 0x1000_0008: nothing lives there
@@ -476,7 +476,7 @@ test "Cpu: an address next to the UART faults and prints nothing" {
 test "Cpu: hello program prints a string" {
     var ram: [256]u8 = @splat(0);
     var cpu = emu.Cpu.init(&ram);
-    cpu.echo = false;
+    cpu.uart.echo = false;
     const prog = [_]u32{
         emu.lT(.hi, a0, 0x2000), //      0: a0 = UART address
         emu.aluImm(.mov, a2, 128), //    1: a2 = address of the string
