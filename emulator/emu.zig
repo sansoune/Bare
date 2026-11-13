@@ -48,5 +48,5 @@ pub fn main(init: std.process.Init) !void {
     var steps: usize = 0;
     while (!machine.halted and steps < 1000) : (steps += 1) machine.step();
 
-    std.debug.print("a0 = {d}, a1 = {d}, bytes = {d}, steps = {d}\n", .{ cpu.getReg(a0), cpu.getReg(a1), size, steps });
+    std.debug.print("a0 = {d}, a1 = {d}, bytes = {d}, steps = {d}\n", .{ machine.getReg(a0), machine.getReg(a1), size, steps });
 }
