@@ -1,5 +1,6 @@
 const std = @import("std");
 const emu = @import("emu.zig");
+const isa = @import("isa.zig");
 
 pub const AsmError = error{
     EmptyLine, // nothing but spaces or a comment
@@ -296,6 +297,12 @@ fn parseLine(line: []const u8) AsmError!Parsed {
     return p;
 }
 
+fn csrOperand(text: []const u8) AsmError!isa.Csr {
+    if (std.meta.stringToEnum(isa.Csr, text)) |c| return c;
+    const n = try number(text, 0, 65535);
+    return @fromBackingInt(@intCast(n));
+}
+
 fn assembleSingle(mnemonic: []const u8, args: []const []const u8, ctx: ?Context) AsmError!u32 {
     if (aluFunc(mnemonic)) |func| return asmAlu(func, args);
     for (mem_ops) |m| if (is(m.name, mnemonic)) return asmMem(m, args);
@@ -336,6 +343,22 @@ fn assembleSingle(mnemonic: []const u8, args: []const []const u8, ctx: ?Context)
         const imm = try number(args[1], -1048576, 1048575);
         const op: emu.Opcode = if (is(mnemonic, "hi")) .hi else .pchi;
         return emu.lT(op, rd, @intCast(imm));
+    }
+    if (is(mnemonic, "ecall")) {
+        try needOperands(args, 0);
+        return isa.ecall();
+    }
+    if (is(mnemonic, "eret")) {
+        try needOperands(args, 0);
+        return isa.eret();
+    }
+    if (is(mnemonic, "csrr")) { // csrr rd, tvec
+        try needOperands(args, 2);
+        return isa.csrr(try reg(args[0]), try csrOperand(args[1]));
+    }
+    if (is(mnemonic, "csrw")) { // csrw tvec, rs
+        try needOperands(args, 2);
+        return isa.csrw(try csrOperand(args[0]), try reg(args[1]));
     }
 
     return error.UnknownMnemonic;

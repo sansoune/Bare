@@ -8,12 +8,17 @@ pub const Cpu = cpu.Cpu;
 pub const Opcode = isa.Opcode;
 pub const Func = isa.Func;
 pub const Priv = isa.Priv;
+pub const Csr = isa.Csr;
 
 pub const aluReg = isa.aluReg;
 pub const aluImm = isa.aluImm;
 pub const iT = isa.iT;
 pub const lT = isa.lT;
 pub const ebreak = isa.ebreak;
+pub const ecall = isa.ecall;
+pub const eret = isa.eret;
+pub const csrr = isa.csrr;
+pub const csrw = isa.csrw;
 pub const loadT = isa.loadT;
 pub const storeT = isa.storeT;
 pub const Fault = cpu.Fault;

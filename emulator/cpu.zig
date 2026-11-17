@@ -3,14 +3,15 @@ const uart = @import("uart.zig");
 const isa = @import("isa.zig");
 const memory = @import("memory.zig");
 
-pub const Fault = enum {
-    illegal_instruction,
-    fetch_misaligned, //    value = the pc
-    fetch_access, //        value = the pc
-    load_misaligned, //     value = the address
-    load_access, //         value = the address
-    store_misaligned, //    value = the address
-    store_access, //        value = the address
+pub const Fault = enum(u8) {
+    illegal_instruction = 1,
+    fetch_misaligned = 2, //    value = the pc
+    fetch_access = 3, //        value = the pc
+    load_misaligned = 4, //     value = the address
+    load_access = 5, //         value = the address
+    store_misaligned = 6, //    value = the address
+    store_access = 7, //        value = the address
+    ecall = 8,
 };
 
 fn sext8(v: u64) u64 {
@@ -39,6 +40,13 @@ pub const Cpu = struct {
     fault: ?FaultInfo = null,
 
     uart: uart.Buffer = .{},
+
+    tvec: u64 = 0,
+    epc: u64 = 0,
+    cause: u64 = 0,
+    tval: u64 = 0,
+    in_trap: bool = false, //   true from trap entry until eret
+    redirected: bool = false, // this step already decided the new pc (trap or fault)
 
     pub fn init(mem: []u8) Cpu {
         return .{ .mem = mem };
@@ -78,9 +86,45 @@ pub const Cpu = struct {
     }
 
     fn raise(self: *Cpu, cause: Fault, value: u64) void {
-        self.fault = .{ .fault = cause, .pc = self.pc, .value = value };
-        self.halted = true;
-        if (self.uart.echo) std.debug.print("{s}: 0x{x} at pc=0x{x}\n", .{ @tagName(cause), value, self.pc });
+        self.trap(cause, value, self.pc);
+    }
+
+    fn trap(self: *Cpu, fault: Fault, value: u64, resume_pc: u64) void {
+        self.redirected = true; // step() must not overwrite pc
+
+        // No handler, or a fault inside a handler: stop the machine.
+        if (self.tvec == 0 or self.in_trap) {
+            self.fault = .{ .fault = fault, .pc = self.pc, .value = value };
+            self.halted = true;
+            return;
+        }
+
+        self.epc = resume_pc;
+        self.cause = @backingInt(fault);
+        self.tval = value;
+        self.in_trap = true;
+        self.pc = self.tvec;
+    }
+
+    fn readCsr(self: *Cpu, csr: isa.Csr) ?u64 {
+        return switch (csr) {
+            .tvec => self.tvec,
+            .epc => self.epc,
+            .cause => self.cause,
+            .tval => self.tval,
+            else => null,
+        };
+    }
+
+    fn writeCsr(self: *Cpu, csr: isa.Csr, value: u64) bool {
+        switch (csr) {
+            .tvec => self.tvec = value,
+            .epc => self.epc = value,
+            .cause => self.cause = value,
+            .tval => self.tval = value,
+            else => return false,
+        }
+        return true;
     }
 
     fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
@@ -98,6 +142,7 @@ pub const Cpu = struct {
     }
 
     pub fn step(self: *Cpu) void {
+        self.redirected = false;
         const inst = self.fetch() orelse return;
 
         const op: isa.Opcode = @fromBackingInt(@intCast(@as(u6, @truncate(inst >> 26))));
@@ -203,13 +248,29 @@ pub const Cpu = struct {
                 next_pc = target;
             },
             .priv => {
-                // Temporary: ebreak just stops the machine for now.
                 const pf: isa.Priv = @fromBackingInt(@intCast(funct));
-                if (pf == .ebreak) self.halted = true else self.illegal(inst);
+                const csr: isa.Csr = @fromBackingInt(@intCast(imm16));
+                switch (pf) {
+                    .ecall => self.trap(.ecall, 0, self.pc +% 4),
+                    .ebreak => self.halted = true,
+                    .eret => {
+                        if (!self.in_trap) return self.illegal(inst);
+                        self.in_trap = false;
+                        next_pc = self.epc;
+                    },
+                    .csrr => {
+                        const v = self.readCsr(csr) orelse return self.illegal(inst);
+                        self.setReg(a, v);
+                    },
+                    .csrw => {
+                        if (!self.writeCsr(csr, self.getReg(a))) return self.illegal(inst);
+                    },
+                    else => self.illegal(inst),
+                }
             },
             else => self.illegal(inst),
         }
 
-        if (self.fault == null) self.pc = next_pc;
+        if (!self.redirected) self.pc = next_pc;
     }
 };

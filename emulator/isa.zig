@@ -45,8 +45,23 @@ pub const Func = enum(u5) {
 pub const Priv = enum(u5) {
     ecall = 0,
     ebreak = 1,
+    eret = 2,
+    csrr = 3,
+    csrw = 4,
     _,
 };
+
+pub const Csr = enum(u16) {
+    tvec = 0,
+    epc = 1,
+    cause = 2,
+    tval = 3,
+    _,
+};
+
+fn privWord(f: Priv, a: u32, payload: u32) u32 {
+    return (@as(u32, @backingInt(Opcode.priv)) << 26) | (a << 21) | (@as(u32, @backingInt(f)) << 16) | (payload & 0xFFFF);
+}
 
 pub fn aluReg(f: Func, dst: u32, src: u32) u32 { // dst = dst <f> register
     return (@as(u32, @backingInt(Opcode.alu)) << 26) | (dst << 21) | (@as(u32, @backingInt(f)) << 16) | src;
@@ -59,6 +74,21 @@ pub fn iT(op: Opcode, a: u32, b: u32, imm: i32) u32 {
 }
 pub fn ebreak() u32 {
     return (@as(u32, @backingInt(Opcode.priv)) << 26) | (@as(u32, @backingInt(Priv.ebreak)) << 16);
+}
+
+pub fn ecall() u32 {
+    return privWord(.ecall, 0, 0);
+}
+
+pub fn eret() u32 {
+    return privWord(.eret, 0, 0);
+}
+
+pub fn csrr(rd: u32, csr: Csr) u32 {
+    return privWord(.csrr, rd, @backingInt(csr));
+}
+pub fn csrw(csr: Csr, rs: u32) u32 {
+    return privWord(.csrw, rs, @backingInt(csr));
 }
 
 pub fn lT(op: Opcode, rd: u32, imm: i32) u32 {
