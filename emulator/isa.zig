@@ -56,6 +56,7 @@ pub const Csr = enum(u16) {
     epc = 1,
     cause = 2,
     tval = 3,
+    ie = 4,
     _,
 };
 

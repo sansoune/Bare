@@ -2,6 +2,7 @@ const std = @import("std");
 const uart = @import("uart.zig");
 const isa = @import("isa.zig");
 const memory = @import("memory.zig");
+const timer = @import("timer.zig");
 
 pub const Fault = enum(u8) {
     illegal_instruction = 1,
@@ -12,6 +13,7 @@ pub const Fault = enum(u8) {
     store_misaligned = 6, //    value = the address
     store_access = 7, //        value = the address
     ecall = 8,
+    timer_interrupt = 16,
 };
 
 fn sext8(v: u64) u64 {
@@ -47,6 +49,9 @@ pub const Cpu = struct {
     tval: u64 = 0,
     in_trap: bool = false, //   true from trap entry until eret
     redirected: bool = false, // this step already decided the new pc (trap or fault)
+
+    timer: timer.Timer = .{},
+    ie: u64 = 0,
 
     pub fn init(mem: []u8) Cpu {
         return .{ .mem = mem };
@@ -112,6 +117,7 @@ pub const Cpu = struct {
             .epc => self.epc,
             .cause => self.cause,
             .tval => self.tval,
+            .ie => self.ie,
             else => null,
         };
     }
@@ -122,27 +128,35 @@ pub const Cpu = struct {
             .epc => self.epc = value,
             .cause => self.cause = value,
             .tval => self.tval = value,
+            .ie => self.ie = value,
             else => return false,
         }
         return true;
     }
 
-    fn memLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
-        if (uart.load(addr)) |value| return value;
+    fn busLoad(self: *Cpu, addr: u64, size: u64) ?u64 {
+        if (uart.load(addr)) |v| return v;
+        if (self.timer.load(addr, size)) |v| return v;
         return memory.load(self.mem, addr, size);
     }
 
-    fn memStore(self: *Cpu, addr: u64, size: u64, value: u64) bool {
+    fn busStore(self: *Cpu, addr: u64, size: u64, value: u64) bool {
         if (addr == uart.uart_tx) {
             self.uart.transmit(value);
             return true;
         }
-
+        if (addr == timer.cmp_addr) return self.timer.store(addr, size, value);
         return memory.store(self.mem, addr, size, value);
     }
 
     pub fn step(self: *Cpu) void {
         self.redirected = false;
+
+        self.timer.tick();
+        if (self.ie & 1 != 0 and self.tvec != 0 and !self.in_trap and self.timer.pending()) {
+            return self.trap(.timer_interrupt, 0, self.pc);
+        }
+
         const inst = self.fetch() orelse return;
 
         const op: isa.Opcode = @fromBackingInt(@intCast(@as(u6, @truncate(inst >> 26))));
@@ -198,7 +212,7 @@ pub const Cpu = struct {
                     else => 8,
                 };
                 if (addr & (size - 1) != 0) return self.raise(.load_misaligned, addr);
-                const raw = self.memLoad(addr, size) orelse
+                const raw = self.busLoad(addr, size) orelse
                     return self.raise(.load_access, addr);
                 const v: u64 = switch (op) {
                     .lb => sext8(raw),
@@ -218,7 +232,7 @@ pub const Cpu = struct {
                     else => 8,
                 };
                 if (addr & (size - 1) != 0) return self.raise(.store_misaligned, addr);
-                if (!self.memStore(addr, size, self.getReg(a))) {
+                if (!self.busStore(addr, size, self.getReg(a))) {
                     return self.raise(.store_access, addr);
                 }
             },
